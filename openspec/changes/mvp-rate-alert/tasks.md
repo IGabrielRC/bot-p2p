@@ -34,7 +34,7 @@ Reasoning (taught, not hidden — preference #936): greenfield, 5 layers, 31 tas
 
 ## Phase 1: Foundation / Infrastructure
 
-- [ ] 1.1 **Project scaffold**: create `package.json` (Node 22 LTS, TS strict, deps: grammY, decimal.js, googleapis, pino, better-sqlite3), `tsconfig.json`, `vitest.config.ts`, eslint+prettier configs, extend `.gitignore`. Done: `npm run build` + `npx vitest run` green on placeholder suite. ~120L
+- [x] 1.1 **Project scaffold**: create `package.json` (Node 22 LTS, TS strict, deps: grammY, decimal.js, googleapis, pino, better-sqlite3), `tsconfig.json`, `vitest.config.ts`, eslint+prettier configs, extend `.gitignore`. Done: `npm run build` + `npx vitest run` green on placeholder suite. ~120L
 - [x] 1.2 **Env config** `src/infra/env.ts`: typed parse of `BOT_TOKEN`, `DEVELOPER_CHAT_ID`, `ENCRYPTION_KEY` (32-byte hex), `ALLOWLIST_TELEGRAM_IDS`, `GMAIL_POLL_INTERVAL_S=45`, `ALERT_RETRY_BASE_S=30`, `ALERT_RETRY_CAP_S=600`, `ALERT_RETRY_MAX_ATTEMPTS=5`, `BAPI_TIMEOUT_MS`; fail-fast on missing/invalid. Write `.env.example` documenting every var. Test: missing var throws loud error; defaults asserted (`test/infra/env.test.ts`). ~110L
 - [ ] 1.3 **SQLite layer** `src/infra/db.ts`: tables `clients(chat_id PK, name, default_margin_pct, conv_margin_pct, locale, onboarded_at)`, `processed_messages(message_id PK, status)`, `parse_anomalies`, `audit_log(actor, action, detail, ts)`, `vault(client_id, kind, iv, tag, ciphertext)`; in-memory mode for tests. Test: schema + PK constraint (`test/infra/db.test.ts`). ~90L
 - [x] 1.4 **AES-256-GCM vault** `src/infra/vault.ts`: encrypt/decrypt envelope, key from `ENCRYPTION_KEY`. Test: roundtrip; tampered tag rejects; ciphertext ≠ plaintext (`test/infra/vault.test.ts`). ~80L

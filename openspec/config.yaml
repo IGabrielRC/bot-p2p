@@ -1,0 +1,40 @@
+schema: spec-driven
+
+context: |
+  Project: Telegram bot assisting a casa de cambio owner (Kelly, operating from Spain)
+  who sells EUR->Bs conversions priced off Binance P2P. See PROJECT_BRIEF.md as seed context.
+  Tech stack: PENDING DECISION (greenfield; candidates Node.js/TypeScript or Python per brief §6).
+  Architecture: layered - Telegram transport <-> business logic <-> Binance adapter (brief §6).
+  Testing: none yet - no test runner until stack is chosen (strict_tdd: false).
+  Style: code/comments/docs in English; user-facing bot copy in neutral professional Spanish.
+  MVP scope confirmed 2026-08-22: Module A (rate on demand) + Module C (payment alert),
+  both with Telegram inline-keyboard UX. Module B (auto-posting) deferred to post-demo pitch.
+  Client voice evidence: conversaciones/transcripts/ (6 notes, 2026-08-16).
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+    - MVP scope is Modules A + C only; flag any scope creep toward Module B
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Client-facing bot interactions MUST use Telegram inline keyboard buttons
+  design:
+    - Isolate all Binance gray-zone knowledge in ONE adapter module (brief §6)
+    - Zero hardcoded client data; multi-tenant-ready per-client config storage
+    - Fail loudly: endpoint/auth failures MUST alert the developer immediately
+    - Secrets encrypted at rest, never plaintext, never in code (brief §5)
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+  apply:
+    guidelines:
+      - Follow existing code patterns
+    tdd: false
+    test_command: ""
+  verify:
+    test_command: ""
+    build_command: ""
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas

@@ -1,0 +1,27 @@
+# Private client data - never commit audio, transcripts, or env secrets
+conversaciones/
+.env
+*.env
+!.env.example
+
+# Local tooling caches
+.atl/
+.codegraph/
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+*.log
+.eslintcache
+*.tsbuildinfo
+
+# OS / editor noise
+Thumbs.db
+.DS_Store

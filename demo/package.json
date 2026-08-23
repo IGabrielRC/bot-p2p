@@ -1,0 +1,17 @@
+{
+  "name": "bot-p2p-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway validation spike: /tasa Telegram demo bot. Not production code.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "grammy": "^1.30.0"
+  }
+}

@@ -48,9 +48,10 @@ function parseAmount(raw) {
 }
 
 // ------------------------------------------------------- BAPI (primary) -----
-// Pinned request shapes, copied verbatim from src/adapters/binance/legs.ts.
-const BAPI_URL = "https://bapi.binance.com/bapi/c2c/v1/friendly/p2p/adv/search";
-const VES_LEG = { page: 1, rows: 5, asset: "USDT", fiat: "VES", tradeType: "SELL", payTypes: [], publisherType: null };
+// v2 endpoint (p2p.binance.com) verified live 2026-08-23; the legacy
+// bapi.binance.com v1 path is WAF-blocked from some egress networks.
+const BAPI_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search";
+const VES_LEG = { page: 1, rows: 20, asset: "USDT", fiat: "VES", tradeType: "SELL", payTypes: [], publisherType: null };
 // Restock side: tradeType=BUY returns SELL ads (what sellers ask) — her cost to replenish.
 const VES_BUY_LEG = { page: 1, rows: 5, asset: "USDT", fiat: "VES", tradeType: "BUY", payTypes: [], publisherType: null };
 
@@ -64,7 +65,7 @@ function browserishHeaders() {
   };
 }
 
-async function bapiBestPrice(leg, side) {
+async function bapiFetchAds(leg) {
   const res = await fetch(BAPI_URL, {
     method: "POST",
     headers: browserishHeaders(),
@@ -74,7 +75,11 @@ async function bapiBestPrice(leg, side) {
   if (!res.ok) throw new Error(`BAPI HTTP ${res.status} (${leg.fiat}/${leg.tradeType})`);
   const body = await res.json();
   if (String(body.code) !== "000000") throw new Error(`BAPI code ${body.code} (${body.message ?? "?"})`);
-  const ads = Array.isArray(body.data) ? body.data : [];
+  return Array.isArray(body.data) ? body.data : [];
+}
+
+async function bapiBestPrice(leg, side) {
+  const ads = await bapiFetchAds(leg);
   const prices = ads
     .map((ad) => Number(ad?.adv?.price))
     .filter((p) => Number.isFinite(p) && p > 0);
@@ -82,6 +87,42 @@ async function bapiBestPrice(leg, side) {
   // tradeType=SELL returns BUY ads → best offer FOR HER selling is the MAX price paid.
   // tradeType=BUY  returns SELL ads → best price to restock is the MIN ask.
   return side === "max" ? Math.max(...prices) : Math.min(...prices);
+}
+
+// Kelly's buyer filter (WA0152/WA0168): pays fast, no drama, proven history.
+const BUYER_MAX_PAY_MINUTES = 15;
+const BUYER_MIN_FINISH_RATE = 90; // percent of completed orders
+const BUYER_MIN_ORDERS = 10;
+const DRAMA_WORDS = /c[eé]dula|rif\b|factura|verificaci[oó]n completa|llamada/i;
+
+function finishRatePct(advertiser) {
+  const raw = Number(advertiser?.monthFinishRate);
+  if (!Number.isFinite(raw)) return null;
+  return raw <= 1 ? raw * 100 : raw; // tolerate 0-1 fraction or 0-100 scale
+}
+
+async function bestBuyers() {
+  const ads = await bapiFetchAds(VES_LEG);
+  const buyers = ads
+    .map((ad) => ({
+      price: Number(ad?.adv?.price),
+      payMin: Number(ad?.adv?.payTimeLimit),
+      remarks: String(ad?.adv?.remarks ?? ""),
+      nick: String(ad?.advertiser?.nickName ?? "comprador"),
+      finish: finishRatePct(ad?.advertiser),
+      orders: Number(ad?.advertiser?.monthOrderCount),
+    }))
+    .filter((b) => Number.isFinite(b.price) && b.price > 0)
+    .sort((a, b) => b.price - a.price);
+
+  const strict = buyers.filter(
+    (b) =>
+      Number.isFinite(b.payMin) && b.payMin <= BUYER_MAX_PAY_MINUTES &&
+      b.finish !== null && b.finish >= BUYER_MIN_FINISH_RATE &&
+      Number.isFinite(b.orders) && b.orders >= BUYER_MIN_ORDERS,
+  );
+  const list = strict.length > 0 ? strict : buyers.slice(0, 3);
+  return { strictHit: strict.length > 0, list: list.slice(0, 3), total: buyers.length };
 }
 
 async function fetchJson(url) {
@@ -134,18 +175,15 @@ function footer(rates) {
 
 // ------------------------------------------------------------ text views ----
 function tasaKeyboard() {
-  return new InlineKeyboard().text("🔄 Actualizar", "tasa:refresh");
+  return new InlineKeyboard().text("🔄 Actualizar", "tasa:refresh").text("🏆 Compradores", "tasa:buyers");
 }
 
 function buildTasaText(rates) {
-  const spreadPct = ((rates.usdtVes - rates.usdtVesRestock) / rates.usdtVesRestock) * 100;
+  // Kelly's daily question (WA0024): ONE number — what buyers pay her today — plus plans.
   const lines = [
-    `💱 <b>Tasa USDT/VES (mercado)</b>`,
-    `🟢 Compradores pagan hasta: <b>${fmtBs(round2HalfUp(rates.usdtVes))}</b> <i>(tu referencia para vender)</i>`,
-    `🔵 Vendedores piden desde: <b>${fmtBs(round2HalfUp(rates.usdtVesRestock))}</b> <i>(tu costo si repones)</i>`,
-    `↔️ Spread del mercado: ${spreadPct.toFixed(2)}%`,
+    `💱 <b>Hoy te pagan</b> <b>${fmtBs(round2HalfUp(rates.usdtVes))}</b> <i>por USDT</i>`,
     "",
-    "<b>Precio por USDT según plan (sobre venta):</b>",
+    "<b>Tu precio según plan:</b>",
     ...MARGIN_TIERS.map(
       (tier) => `• Plan ${tier}% → <b>${fmtBs(round2HalfUp(rates.usdtVes * (1 - tier / 100)))}</b>`,
     ),
@@ -310,7 +348,7 @@ function ayudaHtml() {
     "❓ <b>Ayuda</b>",
     "<b>💱 Tasa</b> — tasa de referencia del mercado con precios por plan.",
     "<b>🧮 Calcular</b> — te guío para calcular una operación. Ejemplo: <code>/calculo 300</code>.",
-    "En las tarjetas de tasa, el botón 🔄 Actualizar refresca los valores sin enviar mensajes nuevos.",
+    "En las tarjetas de tasa: 🔄 refresca sin mensajes nuevos y 🏆 Compradores filtra los que pagan rápido y tienen historial limpio.",
   ].join("\n");
 }
 
@@ -344,6 +382,32 @@ bot.callbackQuery("tasa:refresh", async (ctx) => {
     }
     console.error("[refresh] failed:", error);
     await ctx.answerCallbackQuery("❌ No pude actualizar, intenta de nuevo").catch(() => {});
+  }
+});
+
+// 🏆 Buyer shortlist filtered by Kelly's own standards (fast pay, proven history).
+bot.callbackQuery("tasa:buyers", async (ctx) => {
+  await ctx.answerCallbackQuery("Buscando compradores…");
+  try {
+    const { strictHit, list, total } = await bestBuyers();
+    if (list.length === 0) {
+      await ctx.reply("No pude leer anuncios de compradores en este momento. Intenta más tarde.");
+      return;
+    }
+    const rows = list.map((b, i) => {
+      const drama = DRAMA_WORDS.test(b.remarks) ? " ⚠️ pide requisitos" : "";
+      const finish = b.finish !== null ? `· ${Math.round(b.finish)}% ✅` : "";
+      const orders = Number.isFinite(b.orders) ? ` (${b.orders} órdenes)` : "";
+      const pay = Number.isFinite(b.payMin) ? `· paga en ≤${b.payMin} min` : "";
+      return `${i + 1}. <b>${b.nick}</b> — ${fmtBs(round2HalfUp(b.price))} ${pay} ${finish}${orders}${drama}`;
+    });
+    const head = strictHit
+      ? `<b>🏆 Compradores que cumplen TU filtro</b> <i>(pago ≤15 min · ≥90% completión)</i>\n\n`
+      : `<b>🏆 Top compradores por precio</b> <i>(nadie cumplió el filtro estricto ahora mismo)</i>\n\n`;
+    await ctx.reply(head + rows.join("\n") + `\n\n<i>${total} anuncios analizados · fuente: Binance P2P</i>`, { parse_mode: "HTML" });
+  } catch (error) {
+    console.error("[buyers] failed:", error);
+    await ctx.reply("No pude consultar los compradores en este momento. Intenta más tarde.").catch(() => {});
   }
 });
 

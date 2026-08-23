@@ -88,53 +88,6 @@ async function bapiAvgPrice(leg) {
   return prices.reduce((sum, p) => sum + p, 0) / prices.length;
 }
 
-// Kelly's buyer filter (WA0152/WA0168): pays fast, no drama, proven history.
-const BUYER_MAX_PAY_MINUTES = 15;
-const BUYER_MIN_FINISH_RATE = 90; // percent of completed orders
-const BUYER_MIN_ORDERS = 10;
-const DRAMA_WORDS = /c[eé]dula|rif\b|factura|verificaci[oó]n completa|llamada/i;
-
-function finishRatePct(advertiser) {
-  const raw = Number(advertiser?.monthFinishRate);
-  if (!Number.isFinite(raw)) return null;
-  return raw <= 1 ? raw * 100 : raw; // tolerate 0-1 fraction or 0-100 scale
-}
-
-async function bestBuyers() {
-  const ads = await bapiFetchAds(VES_LEG);
-  const pool = ads
-    .map((ad) => ({
-      price: Number(ad?.adv?.price),
-      payMin: Number(ad?.adv?.payTimeLimit),
-      kyc: ad?.adv?.buyerKycLimit != null,
-      remarks: String(ad?.adv?.remarks ?? ""),
-      nick: String(ad?.advertiser?.nickName ?? "comprador"),
-      finish: finishRatePct(ad?.advertiser),
-      orders: Number(ad?.advertiser?.monthOrderCount),
-    }))
-    .filter((b) => Number.isFinite(b.price) && b.price > 0);
-
-  // Owner rule: drama buyers (KYC demands, cédula/RIF remarks) don't even rank.
-  const excluded = pool.filter((b) => b.kyc || DRAMA_WORDS.test(b.remarks));
-  const buyers = pool
-    .filter((b) => !b.kyc && !DRAMA_WORDS.test(b.remarks))
-    .sort((a, b) => b.price - a.price);
-
-  const strict = buyers.filter(
-    (b) =>
-      Number.isFinite(b.payMin) && b.payMin <= BUYER_MAX_PAY_MINUTES &&
-      b.finish !== null && b.finish >= BUYER_MIN_FINISH_RATE &&
-      Number.isFinite(b.orders) && b.orders >= BUYER_MIN_ORDERS,
-  );
-  const list = strict.length > 0 ? strict : buyers.slice(0, 3);
-  return {
-    strictHit: strict.length > 0,
-    list: list.slice(0, 5),
-    total: buyers.length,
-    excludedCount: excluded.length,
-  };
-}
-
 async function fetchJson(url) {
   const res = await fetch(url, {
     headers: { "user-agent": "bot-p2p-demo-spike" },
@@ -182,7 +135,7 @@ function footer(rates) {
 
 // ------------------------------------------------------------ text views ----
 function tasaKeyboard() {
-  return new InlineKeyboard().text("🔄 Actualizar", "tasa:refresh").text("🏆 Compradores", "tasa:buyers");
+  return new InlineKeyboard().text("🔄 Actualizar", "tasa:refresh");
 }
 
 function buildTasaText(rates) {
@@ -355,7 +308,7 @@ function ayudaHtml() {
     "❓ <b>Ayuda</b>",
     "<b>💱 Tasa</b> — tasa de referencia del mercado con precios por plan.",
     "<b>🧮 Calcular</b> — te guío para calcular una operación. Ejemplo: <code>/calculo 300</code>.",
-    "En las tarjetas de tasa: 🔄 refresca sin mensajes nuevos y 🏆 Compradores filtra los que pagan rápido y tienen historial limpio.",
+    "En las tarjetas de tasa, el botón 🔄 Actualizar refresca los valores sin enviar mensajes nuevos.",
   ].join("\n");
 }
 
@@ -389,32 +342,6 @@ bot.callbackQuery("tasa:refresh", async (ctx) => {
     }
     console.error("[refresh] failed:", error);
     await ctx.answerCallbackQuery("❌ No pude actualizar, intenta de nuevo").catch(() => {});
-  }
-});
-
-// 🏆 Buyer shortlist filtered by Kelly's own standards (fast pay, proven history).
-bot.callbackQuery("tasa:buyers", async (ctx) => {
-  await ctx.answerCallbackQuery("Buscando compradores…");
-  try {
-    const { strictHit, list, total, excludedCount } = await bestBuyers();
-    if (list.length === 0) {
-      await ctx.reply("No pude leer anuncios de compradores en este momento. Intenta más tarde.");
-      return;
-    }
-    const rows = list.map((b, i) => {
-      const finish = b.finish !== null ? `· ${Math.round(b.finish)}% ✅` : "";
-      const orders = Number.isFinite(b.orders) ? ` (${b.orders} órdenes)` : "";
-      const pay = Number.isFinite(b.payMin) ? `· paga en ≤${b.payMin} min` : "";
-      return `${i + 1}. <b>${b.nick}</b> — ${fmtBs(round2HalfUp(b.price))} ${pay} ${finish}${orders}`;
-    });
-    const head = strictHit
-      ? `<b>🏆 Top compradores sin drama</b> <i>(pago ≤15 min · ≥90% completión · sin exigencias)</i>\n\n`
-      : `<b>🏆 Top compradores por precio</b> <i>(nadie pasó el filtro estricto ahora mismo)</i>\n\n`;
-    const excludedNote = excludedCount > 0 ? `\n\n<i>🚫 ${excludedCount} descartados por pedir verificación u otras exigencias</i>` : "";
-    await ctx.reply(head + rows.join("\n") + `\n\n<i>${total} analizados · fuente: Binance P2P</i>` + excludedNote, { parse_mode: "HTML" });
-  } catch (error) {
-    console.error("[buyers] failed:", error);
-    await ctx.reply("No pude consultar los compradores en este momento. Intenta más tarde.").catch(() => {});
   }
 });
 

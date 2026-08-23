@@ -51,7 +51,8 @@ function parseAmount(raw) {
 // Pinned request shapes, copied verbatim from src/adapters/binance/legs.ts.
 const BAPI_URL = "https://bapi.binance.com/bapi/c2c/v1/friendly/p2p/adv/search";
 const VES_LEG = { page: 1, rows: 5, asset: "USDT", fiat: "VES", tradeType: "SELL", payTypes: [], publisherType: null };
-const EUR_LEG = { page: 1, rows: 5, asset: "USDT", fiat: "EUR", tradeType: "BUY", payTypes: [], publisherType: null };
+// Restock side: tradeType=BUY returns SELL ads (what sellers ask) — her cost to replenish.
+const VES_BUY_LEG = { page: 1, rows: 5, asset: "USDT", fiat: "VES", tradeType: "BUY", payTypes: [], publisherType: null };
 
 function browserishHeaders() {
   return {
@@ -63,7 +64,7 @@ function browserishHeaders() {
   };
 }
 
-async function bapiBestPrice(leg) {
+async function bapiBestPrice(leg, side) {
   const res = await fetch(BAPI_URL, {
     method: "POST",
     headers: browserishHeaders(),
@@ -78,8 +79,9 @@ async function bapiBestPrice(leg) {
     .map((ad) => Number(ad?.adv?.price))
     .filter((p) => Number.isFinite(p) && p > 0);
   if (prices.length === 0) throw new Error(`BAPI ${leg.fiat}: no parsable adv.price in ${ads.length} ads`);
-  // Buyer-side book: best price a buyer can get is the lowest ask.
-  return Math.min(...prices);
+  // tradeType=SELL returns BUY ads → best offer FOR HER selling is the MAX price paid.
+  // tradeType=BUY  returns SELL ads → best price to restock is the MIN ask.
+  return side === "max" ? Math.max(...prices) : Math.min(...prices);
 }
 
 async function fetchJson(url) {
@@ -98,26 +100,31 @@ async function fallbackRates() {
   // Explicit paths verified against live payload (2026-08-23): data.best mirrors
   // the top exchange feed (binance). Generic scan kept only as last resort.
   const d = payload?.data ?? {};
-  const ves = d.best?.buy_rate ?? d.binance?.buy_rate ?? d.bybit?.buy_rate;
-  if (!Number.isFinite(ves)) {
+  // buy_rate ≈ what buyers pay (her sale reference); sell_rate ≈ sellers' asks (restock).
+  const usdtVes = d.best?.buy_rate ?? d.binance?.buy_rate ?? d.bybit?.buy_rate;
+  const restock = d.best?.sell_rate ?? d.binance?.sell_rate ?? d.bybit?.sell_rate;
+  if (!Number.isFinite(usdtVes) || !Number.isFinite(restock)) {
     console.log("[rates] fallback candidates:", JSON.stringify(payload)?.slice(0, 400));
     throw new Error("usdt.com.ve: expected rate paths missing from payload");
   }
-  return { usdtVes: ves };
+  return { usdtVes, usdtVesRestock: restock };
 }
 
 // ------------------------------------------------------ rate orchestrator ---
 async function getRates() {
   try {
-    const usdtVes = await bapiBestPrice(VES_LEG);
-    const rates = { source: "bapi", usdtVes };
-    console.log(`[rates] served by BAPI: usdtVes=${usdtVes}`);
+    const [usdtVes, usdtVesRestock] = await Promise.all([
+      bapiBestPrice(VES_LEG, "max"),
+      bapiBestPrice(VES_BUY_LEG, "min"),
+    ]);
+    const rates = { source: "bapi", usdtVes, usdtVesRestock };
+    console.log(`[rates] served by BAPI: sale=${usdtVes} restock=${usdtVesRestock}`);
     return rates;
   } catch (bapiError) {
     console.error("[rates] BAPI failed, trying fallback:", bapiError.message);
   }
   const rates = { source: "alternative", ...(await fallbackRates()) };
-  console.log(`[rates] served by alternative source: usdtVes=${rates.usdtVes}`);
+  console.log(`[rates] served by alternative source: sale=${rates.usdtVes} restock=${rates.usdtVesRestock}`);
   return rates;
 }
 
@@ -131,10 +138,14 @@ function tasaKeyboard() {
 }
 
 function buildTasaText(rates) {
+  const spreadPct = ((rates.usdtVes - rates.usdtVesRestock) / rates.usdtVesRestock) * 100;
   const lines = [
-    `💱 <b>Tasa de referencia USDT/VES</b> (mercado): <b>${fmtBs(round2HalfUp(rates.usdtVes))}</b>`,
+    `💱 <b>Tasa USDT/VES (mercado)</b>`,
+    `🟢 Compradores pagan hasta: <b>${fmtBs(round2HalfUp(rates.usdtVes))}</b> <i>(tu referencia para vender)</i>`,
+    `🔵 Vendedores piden desde: <b>${fmtBs(round2HalfUp(rates.usdtVesRestock))}</b> <i>(tu costo si repones)</i>`,
+    `↔️ Spread del mercado: ${spreadPct.toFixed(2)}%`,
     "",
-    "<b>Precio por USDT según plan:</b>",
+    "<b>Precio por USDT según plan (sobre venta):</b>",
     ...MARGIN_TIERS.map(
       (tier) => `• Plan ${tier}% → <b>${fmtBs(round2HalfUp(rates.usdtVes * (1 - tier / 100)))}</b>`,
     ),

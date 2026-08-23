@@ -52,8 +52,6 @@ function parseAmount(raw) {
 // bapi.binance.com v1 path is WAF-blocked from some egress networks.
 const BAPI_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search";
 const VES_LEG = { page: 1, rows: 20, asset: "USDT", fiat: "VES", tradeType: "SELL", payTypes: [], publisherType: null };
-// Restock side: tradeType=BUY returns SELL ads (what sellers ask) — her cost to replenish.
-const VES_BUY_LEG = { page: 1, rows: 5, asset: "USDT", fiat: "VES", tradeType: "BUY", payTypes: [], publisherType: null };
 
 function browserishHeaders() {
   return {
@@ -78,15 +76,16 @@ async function bapiFetchAds(leg) {
   return Array.isArray(body.data) ? body.data : [];
 }
 
-async function bapiBestPrice(leg, side) {
+// Reference price = AVERAGE across live ads (owner insight 2026-08-23: individual
+// ad prices vary by transaction size; the market average is the honest reference).
+async function bapiAvgPrice(leg) {
   const ads = await bapiFetchAds(leg);
   const prices = ads
     .map((ad) => Number(ad?.adv?.price))
     .filter((p) => Number.isFinite(p) && p > 0);
   if (prices.length === 0) throw new Error(`BAPI ${leg.fiat}: no parsable adv.price in ${ads.length} ads`);
-  // tradeType=SELL returns BUY ads → best offer FOR HER selling is the MAX price paid.
-  // tradeType=BUY  returns SELL ads → best price to restock is the MIN ask.
-  return side === "max" ? Math.max(...prices) : Math.min(...prices);
+  // tradeType=SELL returns BUY ads → what buyers pay; average smooths per-ad size bias.
+  return prices.reduce((sum, p) => sum + p, 0) / prices.length;
 }
 
 // Kelly's buyer filter (WA0152/WA0168): pays fast, no drama, proven history.
@@ -103,16 +102,22 @@ function finishRatePct(advertiser) {
 
 async function bestBuyers() {
   const ads = await bapiFetchAds(VES_LEG);
-  const buyers = ads
+  const pool = ads
     .map((ad) => ({
       price: Number(ad?.adv?.price),
       payMin: Number(ad?.adv?.payTimeLimit),
+      kyc: ad?.adv?.buyerKycLimit != null,
       remarks: String(ad?.adv?.remarks ?? ""),
       nick: String(ad?.advertiser?.nickName ?? "comprador"),
       finish: finishRatePct(ad?.advertiser),
       orders: Number(ad?.advertiser?.monthOrderCount),
     }))
-    .filter((b) => Number.isFinite(b.price) && b.price > 0)
+    .filter((b) => Number.isFinite(b.price) && b.price > 0);
+
+  // Owner rule: drama buyers (KYC demands, cédula/RIF remarks) don't even rank.
+  const excluded = pool.filter((b) => b.kyc || DRAMA_WORDS.test(b.remarks));
+  const buyers = pool
+    .filter((b) => !b.kyc && !DRAMA_WORDS.test(b.remarks))
     .sort((a, b) => b.price - a.price);
 
   const strict = buyers.filter(
@@ -122,7 +127,12 @@ async function bestBuyers() {
       Number.isFinite(b.orders) && b.orders >= BUYER_MIN_ORDERS,
   );
   const list = strict.length > 0 ? strict : buyers.slice(0, 3);
-  return { strictHit: strict.length > 0, list: list.slice(0, 3), total: buyers.length };
+  return {
+    strictHit: strict.length > 0,
+    list: list.slice(0, 5),
+    total: buyers.length,
+    excludedCount: excluded.length,
+  };
 }
 
 async function fetchJson(url) {
@@ -154,18 +164,15 @@ async function fallbackRates() {
 // ------------------------------------------------------ rate orchestrator ---
 async function getRates() {
   try {
-    const [usdtVes, usdtVesRestock] = await Promise.all([
-      bapiBestPrice(VES_LEG, "max"),
-      bapiBestPrice(VES_BUY_LEG, "min"),
-    ]);
-    const rates = { source: "bapi", usdtVes, usdtVesRestock };
-    console.log(`[rates] served by BAPI: sale=${usdtVes} restock=${usdtVesRestock}`);
+    const usdtVes = await bapiAvgPrice(VES_LEG);
+    const rates = { source: "bapi", usdtVes };
+    console.log(`[rates] served by BAPI: avg=${usdtVes}`);
     return rates;
   } catch (bapiError) {
     console.error("[rates] BAPI failed, trying fallback:", bapiError.message);
   }
   const rates = { source: "alternative", ...(await fallbackRates()) };
-  console.log(`[rates] served by alternative source: sale=${rates.usdtVes} restock=${rates.usdtVesRestock}`);
+  console.log(`[rates] served by alternative source: avg=${rates.usdtVes}`);
   return rates;
 }
 
@@ -181,7 +188,7 @@ function tasaKeyboard() {
 function buildTasaText(rates) {
   // Kelly's daily question (WA0024): ONE number — what buyers pay her today — plus plans.
   const lines = [
-    `💱 <b>Hoy te pagan</b> <b>${fmtBs(round2HalfUp(rates.usdtVes))}</b> <i>por USDT</i>`,
+    `💱 <b>Hoy te pagan</b> <b>${fmtBs(round2HalfUp(rates.usdtVes))}</b> <i>por USDT (promedio del mercado)</i>`,
     "",
     "<b>Tu precio según plan:</b>",
     ...MARGIN_TIERS.map(
@@ -389,22 +396,22 @@ bot.callbackQuery("tasa:refresh", async (ctx) => {
 bot.callbackQuery("tasa:buyers", async (ctx) => {
   await ctx.answerCallbackQuery("Buscando compradores…");
   try {
-    const { strictHit, list, total } = await bestBuyers();
+    const { strictHit, list, total, excludedCount } = await bestBuyers();
     if (list.length === 0) {
       await ctx.reply("No pude leer anuncios de compradores en este momento. Intenta más tarde.");
       return;
     }
     const rows = list.map((b, i) => {
-      const drama = DRAMA_WORDS.test(b.remarks) ? " ⚠️ pide requisitos" : "";
       const finish = b.finish !== null ? `· ${Math.round(b.finish)}% ✅` : "";
       const orders = Number.isFinite(b.orders) ? ` (${b.orders} órdenes)` : "";
       const pay = Number.isFinite(b.payMin) ? `· paga en ≤${b.payMin} min` : "";
-      return `${i + 1}. <b>${b.nick}</b> — ${fmtBs(round2HalfUp(b.price))} ${pay} ${finish}${orders}${drama}`;
+      return `${i + 1}. <b>${b.nick}</b> — ${fmtBs(round2HalfUp(b.price))} ${pay} ${finish}${orders}`;
     });
     const head = strictHit
-      ? `<b>🏆 Compradores que cumplen TU filtro</b> <i>(pago ≤15 min · ≥90% completión)</i>\n\n`
-      : `<b>🏆 Top compradores por precio</b> <i>(nadie cumplió el filtro estricto ahora mismo)</i>\n\n`;
-    await ctx.reply(head + rows.join("\n") + `\n\n<i>${total} anuncios analizados · fuente: Binance P2P</i>`, { parse_mode: "HTML" });
+      ? `<b>🏆 Top compradores sin drama</b> <i>(pago ≤15 min · ≥90% completión · sin exigencias)</i>\n\n`
+      : `<b>🏆 Top compradores por precio</b> <i>(nadie pasó el filtro estricto ahora mismo)</i>\n\n`;
+    const excludedNote = excludedCount > 0 ? `\n\n<i>🚫 ${excludedCount} descartados por pedir verificación u otras exigencias</i>` : "";
+    await ctx.reply(head + rows.join("\n") + `\n\n<i>${total} analizados · fuente: Binance P2P</i>` + excludedNote, { parse_mode: "HTML" });
   } catch (error) {
     console.error("[buyers] failed:", error);
     await ctx.reply("No pude consultar los compradores en este momento. Intenta más tarde.").catch(() => {});

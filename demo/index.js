@@ -223,6 +223,31 @@ async function sendTasa(ctx) {
   }
 }
 
+// Conversational /calculo flow: after tapping 🧮 Calcular we wait for a bare number.
+const PENDING_AMOUNT = new Map(); // chatId -> true while awaiting the amount
+
+function planKeyboard(amount) {
+  return new InlineKeyboard()
+    .text("Plan 10%", `calculo:plan:10:${amount}`)
+    .text("8%", `calculo:plan:8:${amount}`)
+    .text("7%", `calculo:plan:7:${amount}`);
+}
+
+async function doCalculo(ctx, amount, marginPct) {
+  try {
+    const rates = await getRates();
+    const text = buildCalculoText(amount, rates, marginPct);
+    if (text === null) {
+      await ctx.reply("No pude obtener la tasa de conversión EUR→USDT en este momento. Prueba más tarde o consulta /tasa.");
+      return;
+    }
+    await ctx.reply(text, { parse_mode: "HTML", reply_markup: planKeyboard(amount) });
+  } catch (error) {
+    console.error("[calculo] failed:", error);
+    await ctx.reply("Lo siento, hubo un problema al calcular. Intenta nuevamente en unos minutos.");
+  }
+}
+
 bot.command("start", async (ctx) => {
   await ctx.reply(
     [
@@ -236,14 +261,33 @@ bot.command("start", async (ctx) => {
 });
 
 // Big-button routing: reply-keyboard buttons arrive as plain text messages.
+// Keyword matching (not emoji equality) — Telegram may alter emoji bytes.
 bot.on("message:text", async (ctx, next) => {
   const t = ctx.message.text.trim();
-  if (t === "💱 Tasa") return sendTasa(ctx);
-  if (t === "🧮 Calcular") {
-    await ctx.reply(calculoUsage(), { parse_mode: "HTML" });
+  const chatId = ctx.chat?.id;
+
+  // A pending amount answer: bare number like "300" or "250,50".
+  if (PENDING_AMOUNT.get(chatId)) {
+    const n = parseAmount(t);
+    if (n !== null && n > 0 && n < 1000000) {
+      PENDING_AMOUNT.delete(chatId);
+      await doCalculo(ctx, n, DEFAULT_MARGIN_PCT);
+      return;
+    }
+    if (!t.startsWith("/")) {
+      await ctx.reply("Escribí solo el monto en euros, por ejemplo: 300");
+      return;
+    }
+    PENDING_AMOUNT.delete(chatId); // a command cancels the pending question
+  }
+
+  if (/tasa/i.test(t) && !t.startsWith("/")) return sendTasa(ctx);
+  if (/calcu/i.test(t) && !t.startsWith("/")) {
+    PENDING_AMOUNT.set(chatId, true);
+    await ctx.reply("🧮 ¿Cuántos euros va a enviar tu cliente? Escribime solo el monto.\n\n<i>Ejemplo: 300</i>", { parse_mode: "HTML" });
     return;
   }
-  if (t === "❓ Ayuda") {
+  if (/ayuda|help/i.test(t) && !t.startsWith("/")) {
     await ctx.reply(ayudaHtml(), { parse_mode: "HTML" });
     return;
   }
@@ -273,30 +317,50 @@ bot.command("calculo", async (ctx) => {
     await ctx.reply(calculoUsage(), { parse_mode: "HTML" });
     return;
   }
+  await doCalculo(ctx, amount, marginPct);
+});
+
+bot.callbackQuery("tasa:refresh", async (ctx) => {
+  try {
+    const rates = await getRates();
+    await ctx.editMessageText(buildTasaText(rates), { reply_markup: tasaKeyboard(), parse_mode: "HTML" });
+    await ctx.answerCallbackQuery("✅ Tasa actualizada"); // visible toast feedback
+  } catch (error) {
+    // Editing identical text is expected while cached rates have not moved yet.
+    if (error instanceof GrammyError && /message is not modified/i.test(error.description ?? error.message)) {
+      await ctx.answerCallbackQuery("La tasa sigue igual — está al día ✅");
+      return;
+    }
+    console.error("[refresh] failed:", error);
+    await ctx.answerCallbackQuery("❌ No pude actualizar, intenta de nuevo").catch(() => {});
+  }
+});
+
+// Plan switcher on calculation cards: tap → same quote recomputed with that margin.
+bot.callbackQuery(/^calculo:plan:(\d+):(\d+(?:[.,]\d+)?)$/, async (ctx) => {
+  const [, pctStr, amountStr] = ctx.match;
+  const marginPct = Number(pctStr);
+  const amount = parseAmount(amountStr);
+  if (![10, 8, 7].includes(marginPct) || amount === null || amount <= 0) {
+    await ctx.answerCallbackQuery("Plan no válido");
+    return;
+  }
   try {
     const rates = await getRates();
     const text = buildCalculoText(amount, rates, marginPct);
     if (text === null) {
-      await ctx.reply("No pude obtener la tasa de conversión EUR→USDT en este momento. Prueba más tarde o consulta /tasa.");
+      await ctx.answerCallbackQuery("❌ Sin tasa EUR→USDT ahora mismo");
       return;
     }
-    await ctx.reply(text, { parse_mode: "HTML" });
+    await ctx.editMessageText(text, { parse_mode: "HTML", reply_markup: planKeyboard(amount) });
+    await ctx.answerCallbackQuery(`Recalculado con plan ${marginPct}%`);
   } catch (error) {
-    console.error("[calculo] failed:", error);
-    await ctx.reply("Lo siento, hubo un problema al calcular. Intenta nuevamente en unos minutos.");
-  }
-});
-
-bot.callbackQuery("tasa:refresh", async (ctx) => {
-  await ctx.answerCallbackQuery(); // immediate ack: removes the loading animation
-  try {
-    const rates = await getRates();
-    await ctx.editMessageText(buildTasaText(rates), { reply_markup: tasaKeyboard(), parse_mode: "HTML" });
-  } catch (error) {
-    // Editing with identical text is expected when rates have not moved yet.
-    if (error instanceof GrammyError && /message is not modified/i.test(error.description ?? error.message)) return;
-    console.error("[refresh] failed:", error);
-    await ctx.reply("No pude actualizar la tasa en este momento. La tarjeta anterior sigue visible.").catch(() => {});
+    if (error instanceof GrammyError && /message is not modified/i.test(error.description ?? error.message)) {
+      await ctx.answerCallbackQuery("Ya está calculado con ese plan");
+      return;
+    }
+    console.error("[plan] failed:", error);
+    await ctx.answerCallbackQuery("❌ No pude recalcular").catch(() => {});
   }
 });
 

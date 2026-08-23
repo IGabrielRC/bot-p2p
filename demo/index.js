@@ -80,34 +80,39 @@ async function bapiBestPrice(leg) {
   return Math.min(...prices);
 }
 
-// --------------------------------------------- usdt.com.ve (fallback) -------
-async function fallbackRates() {
-  const res = await fetch("https://www.usdt.com.ve/api/v1/rates/current", {
+async function fetchJson(url) {
+  const res = await fetch(url, {
     headers: { "user-agent": "bot-p2p-demo-spike" },
     signal: AbortSignal.timeout(15000),
   });
-  if (!res.ok) throw new Error(`usdt.com.ve HTTP ${res.status}`);
-  const payload = await res.json();
+  if (!res.ok) throw new Error(`${new URL(url).host} HTTP ${res.status}`);
+  return res.json();
+}
 
-  // Unknown shape: walk the JSON and collect leaf numbers with their path.
-  const leaves = [];
-  (function walk(node, path, depth) {
-    if (depth > 6 || node === null || typeof node !== "object") return;
-    for (const [key, value] of Object.entries(node)) {
-      const p = `${path}.${key}`.toLowerCase();
-      if (typeof value === "number" && Number.isFinite(value) && value > 0) leaves.push({ path: p, value });
-      else walk(value, p, depth + 1);
-    }
-  })(payload, "", 0);
+// --------------------------------------------- usdt.com.ve (fallback) -------
+async function fallbackRates() {
+  const payload = await fetchJson("https://www.usdt.com.ve/api/v1/rates/current");
 
-  const isBs = (p) => /ves|bolivar|bs/.test(p);
-  const ves = leaves.find((l) => isBs(l.path) && /usdt|usd/.test(l.path));
-  const eur = leaves.find((l) => isBs(l.path) && /eur/.test(l.path));
-  console.log(`[rates] fallback candidates:`, JSON.stringify(leaves.slice(0, 20)));
-  if (!ves) throw new Error("usdt.com.ve: no USDT/VES rate found in payload (see logged candidates)");
-  // Cross-rate derivation from real payload numbers only - never invented.
-  const usdtPerEur = eur ? ves.value / eur.value : null;
-  return { usdtVes: ves.value, usdtPerEur };
+  // Explicit paths verified against live payload (2026-08-23): data.best mirrors
+  // the top exchange feed (binance). Generic scan kept only as last resort.
+  const d = payload?.data ?? {};
+  const ves = d.best?.buy_rate ?? d.binance?.buy_rate ?? d.bybit?.buy_rate;
+  if (!Number.isFinite(ves)) {
+    console.log("[rates] fallback candidates:", JSON.stringify(payload)?.slice(0, 400));
+    throw new Error("usdt.com.ve: expected rate paths missing from payload");
+  }
+
+  // EUR leg: free FX reference (no key). USDT≈USD assumption, acceptable for a
+  // validation spike; production chain derives it from BAPI USDT/EUR instead.
+  let usdtPerEur = null;
+  try {
+    const fx = await fetchJson("https://open.er-api.com/v6/latest/EUR");
+    const usdPerEur = fx?.rates?.USD;
+    if (Number.isFinite(usdPerEur)) usdtPerEur = usdPerEur;
+  } catch (e) {
+    console.error("[rates] EUR fx source failed:", e.message);
+  }
+  return { usdtVes: ves, usdtPerEur };
 }
 
 // ------------------------------------------------------ rate orchestrator ---
@@ -181,6 +186,19 @@ function buildCalculoText(amountEur, rates, marginPct) {
 // -------------------------------------------------------------- bot setup ---
 const bot = new Bot(BOT_TOKEN);
 
+// Register commands so Telegram's ☰ menu button lists them.
+bot.api.setMyCommands([
+  { command: "start", description: "🏠 Menú principal" },
+  { command: "tasa", description: "💱 Tasa del mercado y precios por plan" },
+  { command: "calculo", description: "🧮 Calcular cuántos Bs recibe un cliente" },
+]).catch((e) => console.error("[setup] setMyCommands failed:", e.message));
+
+// Persistent bottom keyboard: Kelly never has to type a command.
+const MAIN_KEYBOARD = {
+  keyboard: [["💱 Tasa", "🧮 Calcular"], ["❓ Ayuda"]],
+  resize_keyboard: true,
+};
+
 // Allowlist guard: checks from.id (never chat.id), silently ignores everyone else.
 bot.use(async (ctx, next) => {
   const uid = ctx.from?.id != null ? String(ctx.from.id) : "";
@@ -206,19 +224,40 @@ async function sendTasa(ctx) {
 }
 
 bot.command("start", async (ctx) => {
-  const keyboard = new InlineKeyboard()
-    .text("💱 Tasa", "menu:tasa")
-    .text("🧮 Calcular", "menu:calculo")
-    .text("❓ Ayuda", "menu:ayuda");
   await ctx.reply(
     [
       "Hola 👋 Soy tu asistente de tasas P2P.",
-      "Puedo mostrarte la tasa actual del mercado y calcular cuántos bolívares recibirás.",
-      "Usa los botones de abajo o escribe /tasa y /calculo.",
+      "Te muestro la tasa actual del mercado y calculo cuántos bolívares recibirá tu cliente.",
+      "",
+      "Usá los botones de abajo 👇 — nunca tenés que escribir comandos.",
     ].join("\n"),
-    { reply_markup: keyboard },
+    { reply_markup: MAIN_KEYBOARD },
   );
 });
+
+// Big-button routing: reply-keyboard buttons arrive as plain text messages.
+bot.on("message:text", async (ctx, next) => {
+  const t = ctx.message.text.trim();
+  if (t === "💱 Tasa") return sendTasa(ctx);
+  if (t === "🧮 Calcular") {
+    await ctx.reply(calculoUsage(), { parse_mode: "HTML" });
+    return;
+  }
+  if (t === "❓ Ayuda") {
+    await ctx.reply(ayudaHtml(), { parse_mode: "HTML" });
+    return;
+  }
+  return next(); // commands like /tasa fall through to their handlers
+});
+
+function ayudaHtml() {
+  return [
+    "❓ <b>Ayuda</b>",
+    "<b>💱 Tasa</b> — tasa de referencia del mercado con precios por plan.",
+    "<b>🧮 Calcular</b> — te guío para calcular una operación. Ejemplo: <code>/calculo 300</code>.",
+    "En las tarjetas de tasa, el botón 🔄 Actualizar refresca los valores sin enviar mensajes nuevos.",
+  ].join("\n");
+}
 
 bot.command("tasa", async (ctx) => sendTasa(ctx));
 
@@ -259,27 +298,6 @@ bot.callbackQuery("tasa:refresh", async (ctx) => {
     console.error("[refresh] failed:", error);
     await ctx.reply("No pude actualizar la tasa en este momento. La tarjeta anterior sigue visible.").catch(() => {});
   }
-});
-
-bot.callbackQuery("menu:tasa", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await sendTasa(ctx);
-});
-bot.callbackQuery("menu:calculo", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await ctx.reply(calculoUsage(), { parse_mode: "HTML" });
-});
-bot.callbackQuery("menu:ayuda", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await ctx.reply(
-    [
-      "❓ <b>Ayuda</b>",
-      "/tasa — tasa de referencia del mercado con precios por plan.",
-      "/calculo monto [plan] — desglose completo de una operación. Ejemplo: <code>/calculo 300</code>.",
-      "En las tarjetas de tasa, el botón 🔄 Actualizar refresca los valores sin enviar mensajes nuevos.",
-    ].join("\n"),
-    { parse_mode: "HTML" },
-  );
 });
 
 bot.catch((err) => {

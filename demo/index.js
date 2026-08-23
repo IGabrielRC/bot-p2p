@@ -15,10 +15,12 @@ if (!BOT_TOKEN) {
 // owner can copy his own into ALLOWED_CHAT_ID. Nobody gets a reply in this mode.
 const DISCOVERY_MODE = !ALLOWED_CHAT_ID;
 
-// Business rules (source of truth: openspec/changes/mvp-rate-alert/design.md D2).
+// Business rules (source of truth: client's own voice notes WA0024/WA0028 +
+// owner correction 2026-08-23). Kelly quotes clients at 1 EUR ≈ 1 USDT parity:
+// the ~13-14% EUR->USDT conversion edge is HER internal arbitrage when
+// restocking, NEVER part of the client-facing quote.
 const FEE_EUR = 3;
 const FEE_THRESHOLD = 300; // inclusive
-const CONV_MARGIN = 0.135; // EUR->USDT conversion margin, default 13.5%
 const MARGIN_TIERS = [10, 8, 7];
 const DEFAULT_MARGIN_PCT = 10;
 
@@ -101,32 +103,21 @@ async function fallbackRates() {
     console.log("[rates] fallback candidates:", JSON.stringify(payload)?.slice(0, 400));
     throw new Error("usdt.com.ve: expected rate paths missing from payload");
   }
-
-  // EUR leg: free FX reference (no key). USDT≈USD assumption, acceptable for a
-  // validation spike; production chain derives it from BAPI USDT/EUR instead.
-  let usdtPerEur = null;
-  try {
-    const fx = await fetchJson("https://open.er-api.com/v6/latest/EUR");
-    const usdPerEur = fx?.rates?.USD;
-    if (Number.isFinite(usdPerEur)) usdtPerEur = usdPerEur;
-  } catch (e) {
-    console.error("[rates] EUR fx source failed:", e.message);
-  }
-  return { usdtVes: ves, usdtPerEur };
+  return { usdtVes: ves };
 }
 
 // ------------------------------------------------------ rate orchestrator ---
 async function getRates() {
   try {
-    const [usdtVes, eurPrice] = await Promise.all([bapiBestPrice(VES_LEG), bapiBestPrice(EUR_LEG)]);
-    const rates = { source: "bapi", usdtVes, usdtPerEur: 1 / eurPrice };
-    console.log(`[rates] served by BAPI: usdtVes=${usdtVes} usdtPerEur=${rates.usdtPerEur}`);
+    const usdtVes = await bapiBestPrice(VES_LEG);
+    const rates = { source: "bapi", usdtVes };
+    console.log(`[rates] served by BAPI: usdtVes=${usdtVes}`);
     return rates;
   } catch (bapiError) {
     console.error("[rates] BAPI failed, trying fallback:", bapiError.message);
   }
   const rates = { source: "alternative", ...(await fallbackRates()) };
-  console.log(`[rates] served by alternative source: usdtVes=${rates.usdtVes} usdtPerEur=${rates.usdtPerEur}`);
+  console.log(`[rates] served by alternative source: usdtVes=${rates.usdtVes}`);
   return rates;
 }
 
@@ -154,8 +145,8 @@ function buildTasaText(rates) {
 function calculoUsage() {
   return [
     "🧮 <b>Cómo calcular</b>",
-    "Escribe: <code>/calculo monto</code> — por ejemplo: <code>/calculo 300</code>",
-    "Opcionalmente puedes indicar el plan: <code>/calculo 300 8</code> (planes: 10, 8 o 7).",
+    "Toca <b>🧮 Calcular</b> y te pregunto el monto, o escribe: <code>/calculo 300</code>",
+    "Puedes indicar cualquier plan: <code>/calculo 300 8</code> o incluso <code>/calculo 250 5,5</code>.",
   ].join("\n");
 }
 
@@ -166,19 +157,13 @@ function buildCalculoText(amountEur, rates, marginPct) {
     net = amountEur - FEE_EUR;
     steps.push(`1️⃣ Comisión: −${fmtEur(FEE_EUR)} (aplica a montos de hasta ${fmtEur(FEE_THRESHOLD)})`);
   }
-  steps.push(`2️⃣ Neto a convertir: ${fmtEur(net)}`);
-
-  if (rates.usdtPerEur == null || !Number.isFinite(rates.usdtPerEur)) {
-    return null; // caller decides the message; never invent a conversion rate
-  }
-  const usdtEq = net * rates.usdtPerEur * (1 - CONV_MARGIN);
-  steps.push(`3️⃣ Conversión EUR→USDT (margen conversión ${(CONV_MARGIN * 100).toFixed(1)}%): ≈ ${usdtEq.toFixed(4)} USDT`);
+  steps.push(`2️⃣ Neto a convertir: ${fmtEur(net)} <i>(≈ ${net.toFixed(2)} USDT)</i>`);
 
   const market = rates.usdtVes;
   const priceVes = market * (1 - marginPct / 100);
-  steps.push(`4️⃣ Margen ${marginPct}% sobre tasa de mercado (${fmtBs(round2HalfUp(market))}): ${fmtBs(round2HalfUp(priceVes))} por USDT`);
+  steps.push(`3️⃣ Plan ${marginPct}% sobre tasa de mercado (${fmtBs(round2HalfUp(market))}): ${fmtBs(round2HalfUp(priceVes))} por USDT`);
 
-  const finalBs = round2HalfUp(usdtEq * priceVes); // single rounding point, HALF_UP
+  const finalBs = round2HalfUp(net * priceVes); // single rounding point, HALF_UP
   steps.push(`✅ Total estimado: <b>${fmtBs(finalBs)}</b>`);
   return `<b>Cálculo para ${fmtEur(amountEur)}</b>\n\n${steps.join("\n")}${footer(rates)}`;
 }
@@ -225,22 +210,20 @@ async function sendTasa(ctx) {
 
 // Conversational /calculo flow: after tapping 🧮 Calcular we wait for a bare number.
 const PENDING_AMOUNT = new Map(); // chatId -> true while awaiting the amount
+const PENDING_PCT = new Map();    // chatId -> amount (EUR) while awaiting a custom margin %
 
 function planKeyboard(amount) {
   return new InlineKeyboard()
     .text("Plan 10%", `calculo:plan:10:${amount}`)
     .text("8%", `calculo:plan:8:${amount}`)
-    .text("7%", `calculo:plan:7:${amount}`);
+    .text("7%", `calculo:plan:7:${amount}`)
+    .text("✏️ Otro %", `calculo:custom:${amount}`);
 }
 
 async function doCalculo(ctx, amount, marginPct) {
   try {
     const rates = await getRates();
     const text = buildCalculoText(amount, rates, marginPct);
-    if (text === null) {
-      await ctx.reply("No pude obtener la tasa de conversión EUR→USDT en este momento. Prueba más tarde o consulta /tasa.");
-      return;
-    }
     await ctx.reply(text, { parse_mode: "HTML", reply_markup: planKeyboard(amount) });
   } catch (error) {
     console.error("[calculo] failed:", error);
@@ -266,6 +249,22 @@ bot.on("message:text", async (ctx, next) => {
   const t = ctx.message.text.trim();
   const chatId = ctx.chat?.id;
 
+  // A pending custom-margin answer: a bare percentage like "5" or "10,1".
+  if (PENDING_PCT.get(chatId) != null) {
+    const amount = PENDING_PCT.get(chatId);
+    const n = parseAmount(t);
+    if (n !== null && n > 0 && n < 100) {
+      PENDING_PCT.delete(chatId);
+      await doCalculo(ctx, amount, n);
+      return;
+    }
+    if (!t.startsWith("/")) {
+      await ctx.reply("Escribí solo el porcentaje, por ejemplo: 5,5");
+      return;
+    }
+    PENDING_PCT.delete(chatId); // a command cancels the pending question
+  }
+
   // A pending amount answer: bare number like "300" or "250,50".
   if (PENDING_AMOUNT.get(chatId)) {
     const n = parseAmount(t);
@@ -283,6 +282,7 @@ bot.on("message:text", async (ctx, next) => {
 
   if (/tasa/i.test(t) && !t.startsWith("/")) return sendTasa(ctx);
   if (/calcu/i.test(t) && !t.startsWith("/")) {
+    PENDING_PCT.delete(chatId);
     PENDING_AMOUNT.set(chatId, true);
     await ctx.reply("🧮 ¿Cuántos euros va a enviar tu cliente? Escribime solo el monto.\n\n<i>Ejemplo: 300</i>", { parse_mode: "HTML" });
     return;
@@ -312,8 +312,8 @@ bot.command("calculo", async (ctx) => {
     await ctx.reply(calculoUsage(), { parse_mode: "HTML" });
     return;
   }
-  const marginPct = parts[1] != null ? Number(parts[1]) : DEFAULT_MARGIN_PCT;
-  if (![10, 8, 7].includes(marginPct)) {
+  const marginPct = parts[1] != null ? parseAmount(parts[1]) : DEFAULT_MARGIN_PCT;
+  if (marginPct === null || marginPct <= 0 || marginPct >= 100) {
     await ctx.reply(calculoUsage(), { parse_mode: "HTML" });
     return;
   }
@@ -362,6 +362,19 @@ bot.callbackQuery(/^calculo:plan:(\d+):(\d+(?:[.,]\d+)?)$/, async (ctx) => {
     console.error("[plan] failed:", error);
     await ctx.answerCallbackQuery("❌ No pude recalcular").catch(() => {});
   }
+});
+
+// ✏️ Otro %: ask for a custom margin percentage conversationally.
+bot.callbackQuery(/^calculo:custom:(\d+(?:[.,]\d+)?)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const amount = parseAmount(ctx.match[1]);
+  if (amount === null || amount <= 0) {
+    await ctx.answerCallbackQuery("Monto no válido");
+    return;
+  }
+  PENDING_AMOUNT.delete(ctx.chat?.id);
+  PENDING_PCT.set(ctx.chat?.id, amount);
+  await ctx.reply(`✏️ ¿Qué porcentaje querés aplicar para ${fmtEur(amount)}? Escribime solo el número.\n\n<i>Ejemplo: 5,5</i>`, { parse_mode: "HTML" });
 });
 
 bot.catch((err) => {

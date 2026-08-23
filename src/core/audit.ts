@@ -66,7 +66,8 @@ export function query(db: Db, filter: AuditFilter = {}, limit = 100): AuditEntry
 
   const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
   params.push(limit);
-  const rows = db.prepare<{ actor: string; action: string; detail: string; ts: string }, (string | number)[]>(
+  // Generic order matters: <BindParameters, Result>.
+  const rows = db.prepare<(string | number)[], AuditEntry>(
     `SELECT actor, action, detail, ts FROM audit_log ${where} ORDER BY ts DESC, rowid DESC LIMIT ?`,
   ).all(...params);
   return rows.map((r) => ({ ...r }));

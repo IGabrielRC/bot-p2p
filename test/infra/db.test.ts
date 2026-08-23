@@ -1,8 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import type { Db } from "../../src/infra/db.js";
+import { describe, expect, it } from "vitest";import type { Db } from "../../src/infra/db.js";
 import { SCHEMA_VERSION, openDatabase } from "../../src/infra/db.js";
 
 const EXPECTED_TABLES = new Set([
@@ -14,7 +13,7 @@ const EXPECTED_TABLES = new Set([
 ]);
 
 function tableNames(db: Db): Set<string> {
-  const rows = db.prepare<{ name: string }, []>(
+  const rows = db.prepare<[], { name: string }>(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
   ).all();
   return new Set(rows.map((r) => r.name));
@@ -42,8 +41,8 @@ describe("openDatabase schema", () => {
     try {
       insertClient(db, 111);
       const row = db.prepare<
-        { default_margin_pct: number; conv_margin_pct: number; locale: string },
-        []
+        [],
+        { default_margin_pct: number; conv_margin_pct: number; locale: string }
       >("SELECT default_margin_pct, conv_margin_pct, locale FROM clients").get();
       expect(row).toEqual({
         default_margin_pct: 10,
@@ -61,7 +60,7 @@ describe("openDatabase schema", () => {
       db.prepare(
         "INSERT INTO processed_messages (message_id, status) VALUES (?, 'pending')",
       ).run("gmail-abc");
-      const row = db.prepare<{ created_at: string }, []>(
+      const row = db.prepare<[], { created_at: string }>(
         "SELECT created_at FROM processed_messages",
       ).get();
       expect(row?.created_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
@@ -105,10 +104,10 @@ describe("migration roundtrip", () => {
       db = undefined;
 
       const reopened = openDatabase(fileDbPath);
-      const clients = reopened.prepare<{ chat_id: number }, []>(
+      const clients = reopened.prepare<[], { chat_id: number }>(
         "SELECT chat_id FROM clients",
       ).all();
-      const audits = reopened.prepare<{ action: string }, []>(
+      const audits = reopened.prepare<[], { action: string }>(
         "SELECT action FROM audit_log",
       ).all();
       expect(clients).toEqual([{ chat_id: 222 }]);

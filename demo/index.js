@@ -159,12 +159,14 @@ function calculoUsage() {
   ].join("\n");
 }
 
-function buildCalculoText(amountEur, rates, marginPct) {
+function buildCalculoText(amountEur, rates, marginPct, feeWaived = false) {
   const steps = [];
   let net = amountEur;
   if (amountEur <= FEE_THRESHOLD) {
     net = amountEur - FEE_EUR;
-    steps.push(`1️⃣ Comisión: −${fmtEur(FEE_EUR)} (aplica a montos de hasta ${fmtEur(FEE_THRESHOLD)})`);
+    steps.push(feeWaived
+      ? `1️⃣ Comisión ${fmtEur(FEE_EUR)}: sin cargo esta vez ✅`
+      : `1️⃣ Comisión: −${fmtEur(FEE_EUR)} (aplica a montos de hasta ${fmtEur(FEE_THRESHOLD)})`);
   }
   steps.push(`2️⃣ Neto a convertir: ${fmtEur(net)} <i>(≈ ${net.toFixed(2)} USDT)</i>`);
 
@@ -221,23 +223,36 @@ async function sendTasa(ctx) {
 const PENDING_AMOUNT = new Map(); // chatId -> true while awaiting the amount
 const PENDING_PCT = new Map();    // chatId -> amount (EUR) while awaiting a custom margin %
 
-function planKeyboard(amount) {
-  return new InlineKeyboard()
-    .text("Plan 10%", `calculo:plan:10:${amount}`)
-    .text("8%", `calculo:plan:8:${amount}`)
-    .text("7%", `calculo:plan:7:${amount}`)
-    .text("✏️ Otro %", `calculo:custom:${amount}`);
+function cardKeyboard(amount, marginPct, feeWaived) {
+  const fw = feeWaived ? 1 : 0;
+  const kb = new InlineKeyboard()
+    .text("10%", `calculo:plan:10:${amount}:${fw}`)
+    .text("8%", `calculo:plan:8:${amount}:${fw}`)
+    .text("7%", `calculo:plan:7:${amount}:${fw}`)
+    .text("✏️ Otro %", `calculo:custom:${amount}:${marginPct}:${fw}`);
+  if (amount <= FEE_THRESHOLD) {
+    const label = feeWaived ? `➕ Aplicar comisión €${FEE_EUR}` : "🚫 Sin comisión";
+    kb.text(label, `calculo:fee:${amount}:${marginPct}:${feeWaived ? 0 : 1}`);
+  }
+  return kb;
 }
 
-async function doCalculo(ctx, amount, marginPct) {
+async function doCalculo(ctx, amount, marginPct, feeWaived = false) {
   try {
     const rates = await getRates();
-    const text = buildCalculoText(amount, rates, marginPct);
-    await ctx.reply(text, { parse_mode: "HTML", reply_markup: planKeyboard(amount) });
+    const text = buildCalculoText(amount, rates, marginPct, feeWaived);
+    await ctx.reply(text, { parse_mode: "HTML", reply_markup: cardKeyboard(amount, marginPct, feeWaived) });
   } catch (error) {
     console.error("[calculo] failed:", error);
     await ctx.reply("Lo siento, hubo un problema al calcular. Intenta nuevamente en unos minutos.");
   }
+}
+
+// Re-render an existing calculation card in place (plan switch / fee toggle).
+async function refreshCard(ctx, amount, marginPct, feeWaived) {
+  const rates = await getRates();
+  const text = buildCalculoText(amount, rates, marginPct, feeWaived);
+  await ctx.editMessageText(text, { parse_mode: "HTML", reply_markup: cardKeyboard(amount, marginPct, feeWaived) });
 }
 
 bot.command("start", async (ctx) => {
@@ -259,12 +274,12 @@ bot.on("message:text", async (ctx, next) => {
   const chatId = ctx.chat?.id;
 
   // A pending custom-margin answer: a bare percentage like "5" or "10,1".
-  if (PENDING_PCT.get(chatId) != null) {
-    const amount = PENDING_PCT.get(chatId);
+  const pendingPct = PENDING_PCT.get(chatId);
+  if (pendingPct != null) {
     const n = parseAmount(t);
     if (n !== null && n > 0 && n < 100) {
       PENDING_PCT.delete(chatId);
-      await doCalculo(ctx, amount, n);
+      await doCalculo(ctx, pendingPct.amount, n, pendingPct.fw === 1);
       return;
     }
     if (!t.startsWith("/")) {
@@ -308,6 +323,7 @@ function ayudaHtml() {
     "❓ <b>Ayuda</b>",
     "<b>💱 Tasa</b> — tasa de referencia del mercado con precios por plan.",
     "<b>🧮 Calcular</b> — te guío para calcular una operación. Ejemplo: <code>/calculo 300</code>.",
+    "En montos de hasta 300 € puedes quitar la comisión con el botón 🚫 Sin comisión.",
     "En las tarjetas de tasa, el botón 🔄 Actualizar refresca los valores sin enviar mensajes nuevos.",
   ].join("\n");
 }
@@ -346,22 +362,16 @@ bot.callbackQuery("tasa:refresh", async (ctx) => {
 });
 
 // Plan switcher on calculation cards: tap → same quote recomputed with that margin.
-bot.callbackQuery(/^calculo:plan:(\d+):(\d+(?:[.,]\d+)?)$/, async (ctx) => {
-  const [, pctStr, amountStr] = ctx.match;
-  const marginPct = Number(pctStr);
+bot.callbackQuery(/^calculo:plan:(\d+(?:[.,]\d+)?):(\d+(?:[.,]\d+)?):(\d)$/, async (ctx) => {
+  const [, pctStr, amountStr, fwStr] = ctx.match;
+  const marginPct = parseAmount(pctStr);
   const amount = parseAmount(amountStr);
-  if (![10, 8, 7].includes(marginPct) || amount === null || amount <= 0) {
+  if (marginPct === null || marginPct <= 0 || marginPct >= 100 || amount === null || amount <= 0) {
     await ctx.answerCallbackQuery("Plan no válido");
     return;
   }
   try {
-    const rates = await getRates();
-    const text = buildCalculoText(amount, rates, marginPct);
-    if (text === null) {
-      await ctx.answerCallbackQuery("❌ Sin tasa EUR→USDT ahora mismo");
-      return;
-    }
-    await ctx.editMessageText(text, { parse_mode: "HTML", reply_markup: planKeyboard(amount) });
+    await refreshCard(ctx, amount, marginPct, fwStr === "1");
     await ctx.answerCallbackQuery(`Recalculado con plan ${marginPct}%`);
   } catch (error) {
     if (error instanceof GrammyError && /message is not modified/i.test(error.description ?? error.message)) {
@@ -374,16 +384,41 @@ bot.callbackQuery(/^calculo:plan:(\d+):(\d+(?:[.,]\d+)?)$/, async (ctx) => {
 });
 
 // ✏️ Otro %: ask for a custom margin percentage conversationally.
-bot.callbackQuery(/^calculo:custom:(\d+(?:[.,]\d+)?)$/, async (ctx) => {
+bot.callbackQuery(/^calculo:custom:(\d+(?:[.,]\d+)?):(\d+(?:[.,]\d+)?):(\d)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const amount = parseAmount(ctx.match[1]);
-  if (amount === null || amount <= 0) {
-    await ctx.answerCallbackQuery("Monto no válido");
+  const marginPct = parseAmount(ctx.match[2]);
+  const fw = ctx.match[3] === "1";
+  if (amount === null || amount <= 0 || marginPct === null || marginPct <= 0) {
+    await ctx.answerCallbackQuery("Datos no válidos");
     return;
   }
   PENDING_AMOUNT.delete(ctx.chat?.id);
-  PENDING_PCT.set(ctx.chat?.id, amount);
+  PENDING_PCT.set(ctx.chat?.id, { amount, fw });
   await ctx.reply(`✏️ ¿Qué porcentaje querés aplicar para ${fmtEur(amount)}? Escribime solo el número.\n\n<i>Ejemplo: 5,5</i>`, { parse_mode: "HTML" });
+});
+
+// 🚫/➕ Fee toggle on cards ≤€300 (WA0028: waiving the €3 is Kelly's call).
+bot.callbackQuery(/^calculo:fee:(\d+(?:[.,]\d+)?):(\d+(?:[.,]\d+)?):(\d)$/, async (ctx) => {
+  const [, amountStr, pctStr, targetStr] = ctx.match;
+  const amount = parseAmount(amountStr);
+  const marginPct = parseAmount(pctStr);
+  const feeWaived = targetStr === "1";
+  if (amount === null || amount <= 0 || marginPct === null || marginPct <= 0) {
+    await ctx.answerCallbackQuery("Datos no válidos");
+    return;
+  }
+  try {
+    await refreshCard(ctx, amount, marginPct, feeWaived);
+    await ctx.answerCallbackQuery(feeWaived ? "Comisión quitada ✅" : `Comisión ${fmtEur(FEE_EUR)} aplicada`);
+  } catch (error) {
+    if (error instanceof GrammyError && /message is not modified/i.test(error.description ?? error.message)) {
+      await ctx.answerCallbackQuery(feeWaived ? "Ya está sin comisión" : "La comisión ya está aplicada");
+      return;
+    }
+    console.error("[fee] failed:", error);
+    await ctx.answerCallbackQuery("❌ No pude actualizar la comisión").catch(() => {});
+  }
 });
 
 bot.catch((err) => {

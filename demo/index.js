@@ -7,10 +7,13 @@ import { Bot, GrammyError, InlineKeyboard } from "grammy";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ALLOWED_CHAT_ID = process.env.ALLOWED_CHAT_ID?.trim();
 
-if (!BOT_TOKEN || !ALLOWED_CHAT_ID) {
-  console.error("Faltan variables de entorno: BOT_TOKEN y/o ALLOWED_CHAT_ID (ver demo/.env).");
+if (!BOT_TOKEN) {
+  console.error("Falta BOT_TOKEN (ver demo/.env).");
   process.exit(1);
 }
+// Discovery mode: token set but no allowlist yet -> log every sender id so the
+// owner can copy his own into ALLOWED_CHAT_ID. Nobody gets a reply in this mode.
+const DISCOVERY_MODE = !ALLOWED_CHAT_ID;
 
 // Business rules (source of truth: openspec/changes/mvp-rate-alert/design.md D2).
 const FEE_EUR = 3;
@@ -181,6 +184,10 @@ const bot = new Bot(BOT_TOKEN);
 // Allowlist guard: checks from.id (never chat.id), silently ignores everyone else.
 bot.use(async (ctx, next) => {
   const uid = ctx.from?.id != null ? String(ctx.from.id) : "";
+  if (DISCOVERY_MODE) {
+    if (uid) console.log(`[discovery] tu chat id es: ${uid} — copialo en ALLOWED_CHAT_ID (demo/.env) y reinicia`);
+    return;
+  }
   if (uid !== ALLOWED_CHAT_ID) {
     if (uid) console.log(`[guard] ignored user ${uid}${ctx.from?.username ? ` @${ctx.from.username}` : ""}`);
     return;
@@ -281,7 +288,9 @@ bot.catch((err) => {
 });
 
 bot.start();
-console.log(`[bot] long polling started (allowlist: ${ALLOWED_CHAT_ID})`);
+console.log(DISCOVERY_MODE
+  ? "[bot] long polling started — MODO DESCUBRIMIENTO: mandale un mensaje al bot desde Telegram y copiá tu chat id en ALLOWED_CHAT_ID"
+  : `[bot] long polling started (allowlist: ${ALLOWED_CHAT_ID})`);
 
 process.once("SIGINT", () => bot.stop());
 process.once("SIGTERM", () => bot.stop());

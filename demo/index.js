@@ -1,6 +1,7 @@
 // Throwaway validation spike - /tasa demo bot for Kelly.
 // Plain JS ESM, no DB, no build step. Do NOT evolve this into production code.
 import "dotenv/config";
+import { createServer } from "node:http";
 import { Bot, GrammyError, InlineKeyboard } from "grammy";
 
 // ---------------------------------------------------------------- config ---
@@ -434,6 +435,18 @@ bot.start();
 console.log(DISCOVERY_MODE
   ? "[bot] long polling started — MODO DESCUBRIMIENTO: mandale un mensaje al bot desde Telegram y copiá tu chat id en ALLOWED_CHAT_ID"
   : `[bot] long polling started (allowlist: ${ALLOWED_CHAT_IDS.join(", ")})`);
+
+// Health endpoint para EasyPanel/Traefik (Railpack espera un puerto HTTP)
+const PORT = Number(process.env.PORT || 3000);
+createServer((req, res) => {
+  if (req.url === "/health" || req.url === "/") {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok");
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+}).listen(PORT, "0.0.0.0", () => console.log(`[health] listening on ${PORT}`));
 
 process.once("SIGINT", () => bot.stop());
 process.once("SIGTERM", () => bot.stop());

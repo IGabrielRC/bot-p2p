@@ -5,15 +5,19 @@ import { Bot, GrammyError, InlineKeyboard } from "grammy";
 
 // ---------------------------------------------------------------- config ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ALLOWED_CHAT_ID = process.env.ALLOWED_CHAT_ID?.trim();
+// Soporta varios IDs separados por coma: "1057242322,987654321"
+const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_ID ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 if (!BOT_TOKEN) {
   console.error("Falta BOT_TOKEN (ver demo/.env).");
   process.exit(1);
 }
-// Discovery mode: token set but no allowlist yet -> log every sender id so the
-// owner can copy his own into ALLOWED_CHAT_ID. Nobody gets a reply in this mode.
-const DISCOVERY_MODE = !ALLOWED_CHAT_ID;
+// Discovery mode: token set pero sin allowlist aún -> loguea cada remitente
+// para que copies su ID a ALLOWED_CHAT_ID.
+const DISCOVERY_MODE = ALLOWED_CHAT_IDS.length === 0;
 
 // Business rules (source of truth: client's own voice notes WA0024/WA0028 +
 // owner correction 2026-08-23). Kelly quotes clients at 1 EUR ≈ 1 USDT parity:
@@ -202,7 +206,7 @@ bot.use(async (ctx, next) => {
     if (uid) console.log(`[discovery] tu chat id es: ${uid} — copialo en ALLOWED_CHAT_ID (demo/.env) y reinicia`);
     return;
   }
-  if (uid !== ALLOWED_CHAT_ID) {
+  if (!ALLOWED_CHAT_IDS.includes(uid)) {
     if (uid) console.log(`[guard] ignored user ${uid}${ctx.from?.username ? ` @${ctx.from.username}` : ""}`);
     return;
   }
@@ -429,7 +433,7 @@ bot.catch((err) => {
 bot.start();
 console.log(DISCOVERY_MODE
   ? "[bot] long polling started — MODO DESCUBRIMIENTO: mandale un mensaje al bot desde Telegram y copiá tu chat id en ALLOWED_CHAT_ID"
-  : `[bot] long polling started (allowlist: ${ALLOWED_CHAT_ID})`);
+  : `[bot] long polling started (allowlist: ${ALLOWED_CHAT_IDS.join(", ")})`);
 
 process.once("SIGINT", () => bot.stop());
 process.once("SIGTERM", () => bot.stop());

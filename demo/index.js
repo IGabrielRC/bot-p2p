@@ -320,7 +320,12 @@ bot.on("message:text", async (ctx, next) => {
     await ctx.reply(ayudaHtml(), { parse_mode: "HTML" });
     return;
   }
-  return next(); // commands like /tasa fall through to their handlers
+  if (t.startsWith("/")) return next(); // commands like /tasa fall through to their handlers
+  // Frictionless entry: any other plain text (hola, etc.) shows the menu
+  await ctx.reply(
+    "No te entendí — usá los botones de abajo 👇 o escribí /start para ver el menú.",
+    { reply_markup: MAIN_KEYBOARD },
+  );
 });
 
 function ayudaHtml() {

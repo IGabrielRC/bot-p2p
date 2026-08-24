@@ -323,7 +323,7 @@ bot.on("message:text", async (ctx, next) => {
   if (t.startsWith("/")) return next(); // commands like /tasa fall through to their handlers
   // Frictionless entry: any other plain text (hola, etc.) shows the menu
   await ctx.reply(
-    "No te entendí — usá los botones de abajo 👇 o escribí /start para ver el menú.",
+    "¡Hola! No te entendí — usá los botones de abajo 👇 o escribí /start para ver el menú. Estoy para ayudarte con tasas y cálculos.",
     { reply_markup: MAIN_KEYBOARD },
   );
 });
